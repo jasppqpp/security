@@ -5,7 +5,7 @@
 Cleaner Telegram Bot
 Python 3.10+
 Requires:
-    pip install "python-telegram-bot[job-queue]>=20,<23"
+    pip install "python-telegram-bot[job-queue]>=20.1,<23"
 
 Environment:
     BOT_TOKEN=YOUR_BOT_TOKEN
@@ -13,15 +13,32 @@ Environment:
 """
 
 import os
+import sys
 import time
 import html
 import sqlite3
 import logging
 import re
-from datetime import datetime, timezone
+import platform
+from pathlib import Path
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
+from logging.handlers import RotatingFileHandler
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    from openai import AsyncOpenAI
+except ImportError:
+    AsyncOpenAI = None
 
 from telegram import (
     Update,
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ChatPermissions,
@@ -38,29 +55,74 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("BOT_TOKEN", "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "1537665613"))
-DEFAULT_ADMINS = {OWNER_ID, 1593947628}
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5").strip()
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "1537665613"))
+    AI_DAILY_LIMIT = max(1, min(100, int(os.getenv("AI_DAILY_LIMIT", "20"))))
+except ValueError as exc:
+    raise RuntimeError("OWNER_ID و AI_DAILY_LIMIT يجب أن تكون قيماً رقمية صحيحة.") from exc
 
-DB_PATH = "bot.db"
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = os.getenv("CLEANER_DB_PATH", str(BASE_DIR / "bot.db"))
+BACKUP_DIR = Path(os.getenv("CLEANER_BACKUP_DIR", str(BASE_DIR / "backups")))
+LOG_PATH = Path(os.getenv("CLEANER_LOG_PATH", str(BASE_DIR / "cleaner.log")))
+STARTED_AT = time.time()
+DEFAULT_ADMINS = {
+    OWNER_ID,
+    1593947628,
+    7115033018,
+    7995739991,
+    5289416158,
+    2087179061,
+    8931268536,
+}
+
 CLEAN_HOURS = 24
 TRACK_RETENTION_HOURS = 48
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 log = logging.getLogger("Cleaner")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    file_handler = RotatingFileHandler(
+        LOG_PATH, maxBytes=1_500_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    log.addHandler(file_handler)
+    log.addHandler(stream_handler)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+try:
+    os.umask(0o077)
+except Exception:
+    pass
 
 
 # =========================================================
 # قاعدة البيانات
 # =========================================================
 
+@contextmanager
 def db():
+    """Open a short-lived SQLite connection and always close it."""
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
-    return con
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=30000")
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 def init_db():
@@ -154,7 +216,25 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_active_moderations_expiry
         ON active_moderations(until_ts);
+
+        CREATE TABLE IF NOT EXISTS audit_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_time INTEGER NOT NULL,
+            actor_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS ai_usage(
+            user_id INTEGER NOT NULL,
+            usage_day TEXT NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(user_id, usage_day)
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_log_time
+        ON audit_log(event_time);
         """)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
 
         # ترقية قاعدة البيانات القديمة دون حذف بياناتها.
         columns = {
@@ -196,11 +276,145 @@ def init_db():
             INSERT OR IGNORE INTO bot_settings(key,value)
             VALUES('enabled','1')
         """)
+        con.execute("""
+            INSERT OR IGNORE INTO bot_settings(key,value)
+            VALUES('ai_enabled','1')
+        """)
 
         con.execute("""
             INSERT OR IGNORE INTO groups(chat_id,title)
             VALUES(0,'الإعدادات العامة')
         """)
+
+
+
+def audit_event(actor_id, action, details=""):
+    """Record a concise administrative event without storing secrets."""
+    safe_details = str(details or "")[:500]
+    try:
+        with db() as con:
+            con.execute(
+                "INSERT INTO audit_log(event_time,actor_id,action,details) VALUES(?,?,?,?)",
+                (int(time.time()), int(actor_id or 0), str(action)[:80], safe_details),
+            )
+    except Exception as exc:
+        log.warning("تعذر تسجيل حدث إداري (%s)", type(exc).__name__)
+
+
+def ai_requests_today(user_id, day):
+    with db() as con:
+        row = con.execute(
+            "SELECT request_count FROM ai_usage WHERE user_id=? AND usage_day=?",
+            (int(user_id), str(day)),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def record_ai_request(user_id, day):
+    with db() as con:
+        con.execute("""
+            INSERT INTO ai_usage(user_id,usage_day,request_count)
+            VALUES(?,?,1)
+            ON CONFLICT(user_id,usage_day)
+            DO UPDATE SET request_count=request_count+1
+        """, (int(user_id), str(day)))
+
+
+def database_health():
+    result = {"integrity": "غير معروف", "size": 0, "groups": 0,
+              "admins": 0, "tracked": 0, "moderations": 0}
+    try:
+        with db() as con:
+            result["integrity"] = con.execute("PRAGMA integrity_check").fetchone()[0]
+            result["groups"] = con.execute("SELECT COUNT(*) FROM groups WHERE chat_id<>0").fetchone()[0]
+            result["admins"] = con.execute("SELECT COUNT(*) FROM bot_admins").fetchone()[0]
+            result["tracked"] = con.execute("SELECT COUNT(*) FROM tracked_messages").fetchone()[0]
+            result["moderations"] = con.execute("SELECT COUNT(*) FROM active_moderations WHERE until_ts>?", (int(time.time()),)).fetchone()[0]
+        result["size"] = Path(DB_PATH).stat().st_size if Path(DB_PATH).exists() else 0
+    except Exception as exc:
+        result["integrity"] = f"فشل الفحص: {type(exc).__name__}"
+    return result
+
+
+def health_text():
+    data = database_health()
+    uptime = max(0, int(time.time() - STARTED_AT))
+    hours, rem = divmod(uptime, 3600)
+    minutes, seconds = divmod(rem, 60)
+    db_state = "سليم ✅" if data["integrity"] == "ok" else f"تحذير ⚠️ ({data['integrity']})"
+    return (
+        "🛡 <b>مركز سلامة Cleaner</b>\n\n"
+        f"• قاعدة البيانات: {db_state}\n"
+        f"• حجم قاعدة البيانات: {data['size'] / 1024:.1f} KB\n"
+        f"• الكروبات المسجلة: {data['groups']}\n"
+        f"• مشرفو البوت: {data['admins']}\n"
+        f"• سجلات التنظيف: {data['tracked']}\n"
+        f"• حالات الكتم/التقييد النشطة: {data['moderations']}\n"
+        f"• الذكاء الاصطناعي: {'متصل بالمفتاح' if OPENAI_API_KEY else 'ينتظر إعداد المفتاح'}\n"
+        f"• نموذج الذكاء الاصطناعي: {html.escape(OPENAI_MODEL)}\n"
+        f"• Python: {platform.python_version()}\n"
+        f"• مدة التشغيل الحالية: {hours} س {minutes} د {seconds} ث"
+    )
+
+
+def groups_overview_text():
+    with db() as con:
+        rows = con.execute("""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) AS enabled_count,
+                   SUM(CASE WHEN enabled=0 THEN 1 ELSE 0 END) AS disabled_count,
+                   SUM(CASE WHEN subscription_enabled=1 THEN 1 ELSE 0 END) AS sub_count
+            FROM groups WHERE chat_id<>0
+        """).fetchone()
+    return (
+        "👥 <b>ملخص الكروبات</b>\n\n"
+        f"• الكروبات المسجلة: {rows['total'] or 0}\n"
+        f"• وظائف Cleaner مفعّلة: {rows['enabled_count'] or 0}\n"
+        f"• وظائف Cleaner متوقفة: {rows['disabled_count'] or 0}\n"
+        f"• الاشتراك الإجباري مفعّل: {rows['sub_count'] or 0}"
+    )
+
+
+def audit_text(limit=12):
+    with db() as con:
+        rows = con.execute(
+            "SELECT event_time,actor_id,action,details FROM audit_log ORDER BY id DESC LIMIT ?",
+            (max(1, min(30, int(limit))),),
+        ).fetchall()
+    if not rows:
+        return "🧾 <b>سجل النشاط</b>\n\nلا توجد أحداث مسجلة بعد."
+    lines = ["🧾 <b>آخر الأحداث الإدارية</b>", ""]
+    for row in rows:
+        stamp = datetime.fromtimestamp(row["event_time"]).strftime("%Y-%m-%d %H:%M")
+        details = html.escape(row["details"] or "")
+        lines.append(f"• <code>{stamp}</code> — {html.escape(row['action'])}\n  ID: <code>{row['actor_id']}</code> {details}")
+    return "\n".join(lines)
+
+
+def create_database_backup():
+    """Create an atomic SQLite backup; retain only the five newest snapshots."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    destination = BACKUP_DIR / f"cleaner_backup_{stamp}.db"
+    source = sqlite3.connect(DB_PATH, timeout=30)
+    target = sqlite3.connect(str(destination), timeout=30)
+    try:
+        source.backup(target)
+        target.commit()
+    finally:
+        target.close()
+        source.close()
+    try:
+        destination.chmod(0o600)
+    except OSError:
+        pass
+    backups = sorted(BACKUP_DIR.glob("cleaner_backup_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[5:]:
+        try:
+            old.unlink()
+        except OSError:
+            log.warning("تعذر حذف نسخة احتياطية قديمة")
+    return destination
 
 
 def setting(key, default=""):
@@ -367,9 +581,9 @@ async def safe_delete(chat_id, message_id, context):
 
     except TelegramError as exc:
         log.debug(
-            "تعذر حذف الرسالة %s: %s",
+            "تعذر حذف الرسالة %s (%s)",
             message_id,
-            exc,
+            type(exc).__name__,
         )
         return False
 
@@ -390,26 +604,15 @@ def kb(rows):
 
 def home_kb():
     return kb([
-        [
-            ("⚙️ إعدادات الحذف", "settings"),
-            ("📊 حالة Cleaner", "stats"),
-        ],
-        [
-            ("💬 الردود التلقائية", "replies"),
-            ("🔔 الاشتراك الإجباري", "subscription"),
-        ],
-        [
-            ("👥 إدارة المشرفين", "admins"),
-            ("🏆 التوب", "topmenu"),
-        ],
-        [
-            ("🔇 إعدادات الكتم والتقييد", "moderation_help"),
-        ],
-        [
-            ("🟢 تشغيل / إيقاف البوت", "global_toggle"),
-        ],
+        [("📊 لوحة المعلومات", "stats"), ("🩺 فحص السلامة", "health")],
+        [("⚙️ إعدادات الكروبات", "settings"), ("👥 ملخص الكروبات", "groups_overview")],
+        [("💬 الردود التلقائية", "replies"), ("🔔 الاشتراك الإجباري", "subscription")],
+        [("🏆 التوب والإحصائيات", "topmenu"), ("🔇 الكتم والتقييد", "moderation_help")],
+        [("🤖 المساعد الإداري AI", "ai_help"), ("🧾 سجل النشاط", "audit")],
+        [("🔌 تشغيل / إيقاف AI", "ai_toggle")],
+        [("💾 نسخة احتياطية", "backup"), ("📖 دليل الاستخدام", "help")],
+        [("👑 إدارة المشرفين", "admins"), ("🟢 تشغيل / إيقاف", "global_toggle")],
     ])
-
 
 def back_kb(destination="home"):
     return kb([[("⬅️ رجوع", destination)]])
@@ -479,12 +682,14 @@ async def show_home(query, user_id):
         else "🔴 متوقف"
     )
 
+    data = database_health()
     await query.edit_message_text(
-        "🤖 <b>لوحة إدارة Cleaner</b>\n\n"
+        "✨ <b>CLEANER PRO — مركز التحكم</b>\n\n"
         f"الحالة العامة: {state}\n"
-        f"الصلاحية: "
-        f"{'👑 المالك' if is_owner(user_id) else '🛡 مشرف بوت'}\n\n"
-        "اختَر الوظيفة من الأزرار:",
+        f"صلاحيتك: {'👑 المالك' if is_owner(user_id) else '🛡 مشرف معتمد'}\n"
+        f"الكروبات: {data['groups']}  •  المشرفون: {data['admins']}\n"
+        f"قاعدة البيانات: {'سليمة ✅' if data['integrity'] == 'ok' else 'تحتاج فحصاً ⚠️'}\n\n"
+        "اختر قسماً من لوحة التحكم:",
         parse_mode="HTML",
         reply_markup=home_kb(),
     )
@@ -644,6 +849,7 @@ async def track_message(update, context):
     # ورسائل المشرفين لتوب المشرفين فقط.
     is_admin = False
     role_checked = False
+    member = None
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         # Telegram API status values are strings: "creator", "administrator",
@@ -678,7 +884,7 @@ async def track_message(update, context):
     # -----------------------------------------------------
 
     if not is_trackable_message(message):
-        return
+        return member
 
     timestamp = int(message.date.timestamp())
 
@@ -704,6 +910,8 @@ async def track_message(update, context):
             DELETE FROM tracked_messages
             WHERE message_date<?
         """, (retention_cutoff,))
+
+    return member
 
 
 # =========================================================
@@ -754,7 +962,9 @@ def stats_text():
         """).fetchone()[0]
 
         messages_count = con.execute("""
-            SELECT COALESCE(SUM(messages),0) FROM users
+            SELECT
+                (SELECT COALESCE(SUM(messages),0) FROM users) +
+                (SELECT COALESCE(SUM(messages),0) FROM admin_messages)
         """).fetchone()[0]
 
         replies_count = con.execute("""
@@ -856,7 +1066,7 @@ async def reset_top(update, context):
             "DELETE FROM users WHERE chat_id=?",
             (chat.id,),
         )
-
+    audit_event(update.effective_user.id if update.effective_user else 0, "top_reset", str(chat.id))
     await message.reply_text("✅ تم تصفير توب المتفاعلين.")
 
 
@@ -1055,6 +1265,20 @@ def remove_moderation(chat_id, user_id):
             "DELETE FROM active_moderations WHERE chat_id=? AND user_id=?",
             (chat_id, user_id),
         )
+
+
+async def prune_tracking_job(context):
+    cutoff = int(time.time()) - TRACK_RETENTION_HOURS * 3600
+    old_usage_day = (datetime.now(timezone.utc).date() - timedelta(days=90)).isoformat()
+    with db() as con:
+        cursor = con.execute(
+            "DELETE FROM tracked_messages WHERE message_date<?", (cutoff,)
+        )
+        con.execute(
+            "DELETE FROM ai_usage WHERE usage_day < ?", (old_usage_day,)
+        )
+    if cursor.rowcount:
+        log.info("Pruned %s expired tracking rows", cursor.rowcount)
 
 
 async def expire_moderations(context):
@@ -1338,13 +1562,31 @@ async def moderate_message(update, context):
     # مهم:
     # التوب يحسب كل الرسائل.
     # سجل التنظيف يستقبل الأنواع المحددة فقط.
-    await track_message(update, context)
+    member = await track_message(update, context)
 
     # الكتم مستقل عن إعدادات الحذف العامة: رسائل المكتوم تُحذف دائماً.
     moderation = active_moderation(chat.id, user.id)
     if moderation and moderation["kind"] == "mute":
         await safe_delete(chat.id, message.message_id, context)
         return
+
+    # معالجات الأوامر تعمل في مجموعة handlers سابقة؛ لا تعالج الأمر مرة ثانية
+    # كرسالة عادية، وخصوصاً أوامر الكتم التي تُرسل رداً على رسالة عضو.
+    if message.text:
+        command_text = message.text.strip()
+        if (
+            command_text.startswith("/")
+            or parse_moderation_command(command_text) is not None
+            or command_text in {
+                "إعدادات الكتم", "اعدادات الكتم",
+                "إعدادات التقييد", "اعدادات التقييد",
+                "تنظيف", "حالة", "توب", "توب المشرفين",
+                "تصفير توب المشرفين", "تصفير التوب",
+                "تصفير توب المتفاعلين", "تفعيل", "/تفعيل",
+                "إيقاف", "/إيقاف",
+            }
+        ):
+            return
 
     if setting("enabled", "1") != "1":
         return
@@ -1354,24 +1596,19 @@ async def moderate_message(update, context):
     if not group or not group.get("enabled", 1):
         return
 
-    # الردود ممنوعة على الأعضاء ومشرفي المجموعة أيضاً،
-    # باستثناء مالك البوت ومالك المجموعة فقط.
-    # الرد على رسالة المستخدم نفسه يبقى مسموحاً.
-    is_group_owner = False
-    try:
-        member = await context.bot.get_chat_member(
-            chat.id, user.id
-        )
-        is_group_owner = member.status == ChatMemberStatus.OWNER
-    except TelegramError:
-        member = None
-
+    # السماح لآيديات البوت الأساسية ومالك الكروب بالرد.
+    # بقية الأعضاء والمشرفين لا يُسمح لهم بالرد على رسائل الآخرين.
+    is_group_owner = (
+        member is not None
+        and member.status == ChatMemberStatus.OWNER
+    )
+    
     if (
         group.get("replies_enabled", 1)
         and message.reply_to_message
         and message.reply_to_message.from_user
         and message.reply_to_message.from_user.id != user.id
-        and not is_owner(user.id)
+        and user.id not in DEFAULT_ADMINS
         and not is_group_owner
     ):
         delete_text = (
@@ -1542,7 +1779,7 @@ async def reset_admin_top(update, context):
 
     with db() as con:
         con.execute("DELETE FROM admin_messages WHERE chat_id=?", (chat.id,))
-
+    audit_event(update.effective_user.id if update.effective_user else 0, "admin_top_reset", str(chat.id))
     await message.reply_text("✅ تم تصفير توب المشرفين فقط.\nالتوب العام لم يتغير.")
 
 
@@ -1742,6 +1979,263 @@ async def subscription_menu(query):
 
 
 # =========================================================
+# المساعد الإداري الذكي (قراءة وتحليل فقط في هذه النسخة)
+# =========================================================
+
+AI_SYSTEM_PROMPT = """
+أنت المساعد الإداري لبوت Telegram اسمه Cleaner.
+تحدث بالعربية الواضحة وباللهجة العراقية عند ملاءمتها.
+ساعد مالك البوت ومشرفيه المعتمدين في فهم الإحصائيات والإعدادات.
+اعتمد فقط على بيانات البوت المرفقة في سياق المحادثة، ولا تخترع أرقاماً.
+هذه النسخة للقراءة والتحليل والإرشاد فقط: لا تدّعِ أنك نفذت تغييراً،
+ولا تطلب كلمات مرور أو مفاتيح API أو توكنات.
+إذا طلب المستخدم تغيير إعداد أو حذف بيانات أو إدارة مشرف، اشرح له
+أن التنفيذ المباشر غير مفعّل بعد، ووجّهه إلى لوحة Cleaner الحالية.
+لا تكشف أسراراً أو بيانات اعتماد، ولا تطلب إرسالها في المحادثة.
+لا تدّعِ الاطلاع على رسائل الأعضاء الخاصة؛ السياق المتاح هو إحصائيات وإعدادات عامة فقط.
+""".strip()
+
+
+def ai_admin_context():
+    """Return a compact snapshot of operational data; never include tokens or API keys."""
+    with db() as con:
+        total_groups = con.execute(
+            "SELECT COUNT(*) FROM groups WHERE chat_id<>0"
+        ).fetchone()[0]
+        groups = con.execute("""
+            SELECT chat_id,title,enabled,replies_enabled,delete_links,
+                   delete_photos,delete_videos,delete_stickers,delete_gifs,
+                   delete_audio,delete_files,delete_forwarded,
+                   subscription_enabled
+            FROM groups WHERE chat_id<>0 ORDER BY title LIMIT 30
+        """).fetchall()
+        users_count = con.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM users"
+        ).fetchone()[0]
+        messages_count = con.execute("""
+            SELECT (SELECT COALESCE(SUM(messages),0) FROM users) +
+                   (SELECT COALESCE(SUM(messages),0) FROM admin_messages)
+        """).fetchone()[0]
+        replies_count = con.execute(
+            "SELECT COUNT(*) FROM auto_replies"
+        ).fetchone()[0]
+        admins_count = con.execute(
+            "SELECT COUNT(*) FROM bot_admins"
+        ).fetchone()[0]
+
+    group_lines = []
+    for g in groups:
+        group_lines.append(
+            f"- {g['title'] or 'مجموعة بدون اسم'}: "
+            f"وظائف المجموعة={'مفعلة' if g['enabled'] else 'متوقفة'}، "
+            f"حذف الردود={'مفعل' if g['replies_enabled'] else 'متوقف'}، "
+            f"الاشتراك الإجباري={'مفعل' if g['subscription_enabled'] else 'متوقف'}"
+        )
+
+    return (
+        f"الحالة العامة: {'مفعّل' if setting('enabled', '1') == '1' else 'متوقف'}\n"
+        f"عدد الكروبات المسجلة: {total_groups} (المعروض بحد أقصى 30)\n"
+        f"عدد المستخدمين المسجلين في التوب: {users_count}\n"
+        f"إجمالي الرسائل المحتسبة في التوب: {messages_count}\n"
+        f"عدد الردود التلقائية: {replies_count}\n"
+        f"عدد مشرفي البوت المسجلين: {admins_count}\n"
+        f"الرسائل المسجلة للتنظيف خلال آخر 24 ساعة: {recent_count()}\n"
+        f"قاعدة البيانات: {database_health()['integrity']}\n"
+        "الكروبات:\n" + ("\n".join(group_lines) if group_lines else "لا توجد كروبات مسجلة.")
+    )
+
+
+async def ai_admin_reply(update, context, prompt=None):
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not message or not user or not chat or chat.type != ChatType.PRIVATE:
+        if message:
+            await message.reply_text("استخدم المساعد في المحادثة الخاصة مع البوت فقط.")
+        return
+
+    if not is_bot_admin(user.id):
+        await message.reply_text("هذه الميزة للمالك ومشرفي البوت المعتمدين فقط.")
+        return
+
+    if setting("ai_enabled", "1") != "1":
+        await message.reply_text("تم إيقاف المساعد الذكي من إعدادات النظام.")
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if ai_requests_today(user.id, today) >= AI_DAILY_LIMIT:
+        await message.reply_text(
+            f"وصلت إلى الحد اليومي للمساعد ({AI_DAILY_LIMIT} سؤالاً). جرّب غداً."
+        )
+        return
+
+    if not OPENAI_API_KEY:
+        await message.reply_text(
+            "🤖 المساعد الإداري جاهز برمجياً، لكن لم تتم إضافة مفتاح OpenAI API إلى بيئة الاستضافة بعد.\n\n"
+            "لا ترسل المفتاح هنا أو داخل تيليجرام. يجب على ولي أمرك/المسؤول عن الحساب إعداده، "
+            "ثم حفظه محلياً في ملف .env باسم OPENAI_API_KEY. لا تضع المفتاح في كود البوت أو ترسله عبر تيليجرام."
+        )
+        return
+
+    if AsyncOpenAI is None:
+        await message.reply_text(
+            "مكتبة OpenAI غير مثبتة. ثبّتها من Bash Console بالأمر: python3.13 -m pip install openai"
+        )
+        return
+
+    prompt = (prompt or "").strip()
+    if len(prompt) > 2000:
+        await message.reply_text("الرسالة طويلة جداً. اختصر سؤالك إلى 2000 حرف كحد أقصى.")
+        return
+    if not prompt:
+        await message.reply_text(
+            "🤖 أنا مساعد Cleaner الإداري.\n"
+            "اسألني عن حالة البوت أو إحصائياته أو إعدادات الكروبات أو اطلب تحليلاً وتوصيات.\n\n"
+            "مثال: حلّل حالة البوت واقترح شنو يحتاج تحسين.\n"
+            "لإنهاء الجلسة أرسل /ai_stop، ولمسح سياقها أرسل /ai_reset."
+        )
+        context.user_data["ai_mode"] = True
+        return
+
+    await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+    history = context.user_data.get("ai_history", [])[-10:]
+    conversation = history + [{"role": "user", "content": prompt}]
+    admin_context = ai_admin_context()
+
+    try:
+        client = context.bot_data.get("openai_client")
+        if client is None:
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=30.0, max_retries=1)
+            context.bot_data["openai_client"] = client
+        response = await client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=(
+                AI_SYSTEM_PROMPT + "\n\nبيانات Cleaner الحالية (مصدر الحقيقة):\n" + admin_context
+            ),
+            input=conversation,
+            max_output_tokens=700,
+        )
+        answer = (response.output_text or "ما قدرت أجهز إجابة حالياً.").strip()
+        record_ai_request(user.id, today)
+        context.user_data["ai_history"] = (
+            conversation + [{"role": "assistant", "content": answer}]
+        )[-12:]
+        context.user_data["ai_mode"] = True
+        # Telegram messages have a 4096-character limit; split long answers safely.
+        for start in range(0, len(answer), 3900):
+            await message.reply_text(answer[start:start + 3900])
+    except Exception as exc:
+        # Avoid logging raw provider exceptions that could contain request metadata.
+        log.error("AI assistant request failed (%s)", type(exc).__name__)
+        await message.reply_text(
+            "تعذر الاتصال بخدمة الذكاء الاصطناعي حالياً. تحقق من إعداد المفتاح والرصيد/حدود الاستخدام، ثم حاول لاحقاً."
+        )
+
+
+async def ai_command(update, context):
+    prompt = " ".join(context.args) if context.args else ""
+    await ai_admin_reply(update, context, prompt)
+
+
+async def ai_stop_command(update, context):
+    if not update.effective_user or not is_bot_admin(update.effective_user.id):
+        return
+    context.user_data["ai_mode"] = False
+    await update.effective_message.reply_text("تم إيقاف وضع المساعد. يمكنك العودة باستخدام /ai.")
+
+
+async def ai_reset_command(update, context):
+    if not update.effective_user or not is_bot_admin(update.effective_user.id):
+        return
+    context.user_data.pop("ai_history", None)
+    context.user_data["ai_mode"] = True
+    await update.effective_message.reply_text("تم مسح سياق محادثة المساعد. اكتب سؤالك الجديد.")
+
+
+async def ai_private_message(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not message.text or not user or not is_bot_admin(user.id):
+        return
+    if context.user_data.get("ai_mode"):
+        await ai_admin_reply(update, context, message.text)
+
+
+
+async def help_command(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message:
+        return
+    if user and is_bot_admin(user.id) and update.effective_chat.type == ChatType.PRIVATE:
+        await message.reply_text(
+            "📖 دليل Cleaner Pro\n\n"
+            "/start — لوحة التحكم\n"
+            "/ai — تشغيل المساعد الإداري\n"
+            "/ai_stop — إيقاف وضع المحادثة\n"
+            "/ai_reset — مسح سياق المحادثة\n"
+            "/health — فحص السلامة\n"
+            "/audit — سجل النشاط\n"
+            "/backup — نسخة احتياطية (المالك فقط)\n\n"
+            "أوامر الكروبات: تنظيف، حالة، توب، توب المشرفين، تفعيل، إيقاف."
+        )
+    else:
+        await message.reply_text("Cleaner يساعد في إدارة الكروب. أوامر المشرفين متاحة للمخولين فقط.")
+
+
+async def health_command(update, context):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message or not is_bot_admin(user.id):
+        if message:
+            await message.reply_text("هذا الفحص لمشرفي البوت المعتمدين فقط.")
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await message.reply_text("استخدم هذا الأمر في الخاص مع البوت.")
+        return
+    await message.reply_text(health_text(), parse_mode="HTML")
+
+
+async def audit_command(update, context):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message or not is_bot_admin(user.id):
+        if message:
+            await message.reply_text("سجل النشاط للمشرفين المعتمدين فقط.")
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await message.reply_text("استخدم هذا الأمر في الخاص مع البوت.")
+        return
+    await message.reply_text(audit_text(), parse_mode="HTML")
+
+
+async def backup_command(update, context):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message or not is_owner(user.id):
+        if message:
+            await message.reply_text("إنشاء النسخ الاحتياطية متاح للمالك فقط.")
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await message.reply_text("نفّذ النسخ الاحتياطي في الخاص مع البوت.")
+        return
+    try:
+        backup_path = create_database_backup()
+        audit_event(user.id, "database_backup", backup_path.name)
+        with open(backup_path, "rb") as backup_file:
+            await message.reply_document(
+                document=backup_file,
+                filename=backup_path.name,
+                caption="💾 نسخة احتياطية من قاعدة بيانات Cleaner. احتفظ بها بمكان خاص وآمن.",
+            )
+    except Exception as exc:
+        log.error("Database backup failed (%s)", type(exc).__name__)
+        await message.reply_text("تعذر إنشاء النسخة الاحتياطية. راجع سجل التشغيل.")
+
+
+
+# =========================================================
 # معالجة أزرار لوحة التحكم
 # =========================================================
 
@@ -1757,10 +2251,51 @@ async def panel_callback(update, context):
         )
         return
 
+    owner_only_actions = {
+        "admins", "admin_add", "global_toggle", "backup", "sub_remove_global", "ai_toggle"
+    }
+    if (data in owner_only_actions or data.startswith("admin_del:")) and not is_owner(user.id):
+        await query.answer("المالك فقط.", show_alert=True)
+        return
+
+    if data.startswith("admin_del:"):
+        try:
+            requested_admin_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await query.answer("آيدي غير صحيح.", show_alert=True)
+            return
+        if requested_admin_id == OWNER_ID or requested_admin_id in DEFAULT_ADMINS:
+            await query.answer("لا يمكن تنزيل المالك أو مشرف أساسي.", show_alert=True)
+            return
+
+    # الضغط على أي زر يلغي إدخالاً معلّقاً سابقاً (مثل انتظار كلمة رد).
+    context.user_data.pop("pending", None)
     await query.answer()
 
     if data == "home":
         await show_home(query, user.id)
+
+    elif data == "ai_toggle":
+        new_state = "0" if setting("ai_enabled", "1") == "1" else "1"
+        set_setting("ai_enabled", new_state)
+        audit_event(user.id, "ai_feature_toggle", new_state)
+        await query.edit_message_text(
+            f"حالة المساعد الذكي: {'مفعّل ✅' if new_state == '1' else 'متوقف ⏸'}\n\n"
+            "إعداد مفتاح API يبقى منفصلاً عن هذا المفتاح.",
+            reply_markup=back_kb("home"),
+        )
+
+    elif data == "ai_help":
+        context.user_data["ai_mode"] = True
+        await query.edit_message_text(
+            "🤖 <b>المساعد الإداري الذكي</b>\n\n"
+            "اسألني عن حالة Cleaner وإحصائياته وإعدادات الكروبات.\n"
+            "هذه النسخة تقرأ وتحلل فقط؛ تنفيذ التغييرات الإدارية سيبقى عبر لوحة التحكم إلى أن نضيف نظام تأكيد آمن.\n\n"
+            "ابدأ بكتابة سؤالك هنا.\n"
+            "/ai_stop لإيقاف المحادثة — /ai_reset لمسح سياقها.",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
 
     elif data == "moderation_help":
         await query.edit_message_text(
@@ -1787,6 +2322,57 @@ async def panel_callback(update, context):
             parse_mode="HTML",
             reply_markup=back_kb(),
         )
+
+    elif data == "health":
+        await query.edit_message_text(
+            health_text(), parse_mode="HTML", reply_markup=back_kb()
+        )
+
+    elif data == "groups_overview":
+        await query.edit_message_text(
+            groups_overview_text(), parse_mode="HTML",
+            reply_markup=kb([
+                [("⚙️ تعديل إعدادات الكروبات", "settings")],
+                [("⬅️ رجوع", "home")],
+            ])
+        )
+
+    elif data == "audit":
+        await query.edit_message_text(
+            audit_text(), parse_mode="HTML", reply_markup=back_kb()
+        )
+
+    elif data == "help":
+        await query.edit_message_text(
+            "📖 <b>دليل Cleaner Pro</b>\n\n"
+            "• لوحة المعلومات: أرقام البوت ونشاطه.\n"
+            "• فحص السلامة: حالة قاعدة البيانات والموارد.\n"
+            "• إعدادات الكروبات: تشغيل وإيقاف أنواع الحذف.\n"
+            "• الردود التلقائية: إضافة الردود العامة وحذفها.\n"
+            "• المساعد الإداري: تحليل البيانات وتقديم التوصيات.\n"
+        "تنبيه خصوصية: عند استخدام AI تُرسل رسالتك وملخص إعدادات وإحصائيات Cleaner إلى مزود الذكاء الاصطناعي؛ لا ترسل بيانات شخصية أو أسراراً.\n"
+            "• سجل النشاط: مراجعة آخر تغييرات المشرفين.\n"
+            "• النسخة الاحتياطية: إنشاء نسخة من قاعدة البيانات (المالك فقط).\n\n"
+            "الأوامر: /start /ai /ai_stop /ai_reset /health /audit /backup",
+            parse_mode="HTML", reply_markup=back_kb()
+        )
+
+    elif data == "backup":
+        if not is_owner(user.id):
+            await query.answer("المالك فقط.", show_alert=True)
+            return
+        try:
+            backup_path = create_database_backup()
+            audit_event(user.id, "database_backup", backup_path.name)
+            with backup_path.open("rb") as backup_file:
+                await query.message.reply_document(
+                    document=backup_file,
+                    filename=backup_path.name,
+                    caption="💾 نسخة احتياطية من قاعدة بيانات Cleaner. احتفظ بها بمكان خاص وآمن.",
+                )
+        except Exception as exc:
+            log.error("Database backup failed (%s)", type(exc).__name__)
+            await query.message.reply_text("تعذر إنشاء النسخة الاحتياطية. راجع سجل التشغيل.")
 
     elif data == "settings":
         await query.edit_message_text(
@@ -1824,11 +2410,9 @@ async def panel_callback(update, context):
 
         group = get_group(chat_id)
 
-        update_group(
-            chat_id,
-            field,
-            0 if group.get(field, 0) else 1,
-        )
+        new_value = 0 if group.get(field, 0) else 1
+        update_group(chat_id, field, new_value)
+        audit_event(user.id, "group_setting_changed", f"chat={chat_id}; {field}={new_value}")
 
         await query.edit_message_reply_markup(
             reply_markup=settings_kb(chat_id),
@@ -1868,7 +2452,7 @@ async def panel_callback(update, context):
                 DELETE FROM auto_replies
                 WHERE id=? AND chat_id=0
             """, (reply_id,))
-
+        audit_event(user.id, "auto_reply_deleted", str(reply_id))
         await replies_menu(query)
 
     elif data == "subscription":
@@ -1885,15 +2469,14 @@ async def panel_callback(update, context):
         )
 
     elif data == "sub_remove_global":
-        # إزالة إعداد الاشتراك العام القديم.
+        # إيقاف الاشتراك الإجباري في جميع الكروبات المسجلة.
         with db() as con:
-            con.execute("""
-                DELETE FROM subscription
-                WHERE chat_id=0
-            """)
+            con.execute("UPDATE groups SET subscription_enabled=0")
+            con.execute("DELETE FROM subscription")
+        audit_event(user.id, "global_subscription_disabled", "all groups")
 
         await query.edit_message_text(
-            "تم حذف سجل الاشتراك العام القديم.",
+            "✅ تم إيقاف الاشتراك الإجباري في جميع الكروبات.",
             reply_markup=back_kb("subscription"),
         )
 
@@ -1920,11 +2503,9 @@ async def panel_callback(update, context):
         chat_id = int(data.split(":", 1)[1])
         group = get_group(chat_id)
 
-        update_group(
-            chat_id,
-            "subscription_enabled",
-            0 if group.get("subscription_enabled") else 1,
-        )
+        new_value = 0 if group.get("subscription_enabled") else 1
+        update_group(chat_id, "subscription_enabled", new_value)
+        audit_event(user.id, "group_subscription_toggle", f"chat={chat_id}; enabled={new_value}")
 
         group = get_group(chat_id)
 
@@ -1965,17 +2546,9 @@ async def panel_callback(update, context):
         )
 
     elif data == "admins":
-        if not is_owner(user.id):
-            await query.answer("المالك فقط.", show_alert=True)
-            return
-
         await admins_menu(query)
 
     elif data == "admin_add":
-        if not is_owner(user.id):
-            await query.answer("المالك فقط.", show_alert=True)
-            return
-
         context.user_data["pending"] = {
             "action": "admin_add"
         }
@@ -1986,37 +2559,20 @@ async def panel_callback(update, context):
         )
 
     elif data.startswith("admin_del:"):
-        if not is_owner(user.id):
-            await query.answer("المالك فقط.", show_alert=True)
-            return
-
         uid = int(data.split(":", 1)[1])
-
-        if uid in DEFAULT_ADMINS:
-            await query.answer(
-                "لا يمكن تنزيل مشرف أساسي.",
-                show_alert=True,
-            )
-            return
 
         with db() as con:
             con.execute(
                 "DELETE FROM bot_admins WHERE user_id=?",
                 (uid,),
             )
-
+        audit_event(user.id, "bot_admin_removed", str(uid))
         await admins_menu(query)
 
     elif data == "global_toggle":
-        if not is_owner(user.id):
-            await query.answer("المالك فقط.", show_alert=True)
-            return
-
-        set_setting(
-            "enabled",
-            "0" if setting("enabled", "1") == "1" else "1",
-        )
-
+        new_state = "0" if setting("enabled", "1") == "1" else "1"
+        set_setting("enabled", new_state)
+        audit_event(user.id, "global_bot_toggle", new_state)
         await show_home(query, user.id)
 
     elif data == "topmenu":
@@ -2190,6 +2746,10 @@ async def private_pending(update, context):
         return
 
     if action == "sub_link":
+        if not value:
+            await message.reply_text("أرسل رابط اشتراك صالحاً ولا تتركه فارغاً.")
+            return
+
         chat_id = state["chat_id"]
 
         update_group(
@@ -2203,6 +2763,7 @@ async def private_pending(update, context):
             "subscription_enabled",
             1,
         )
+        audit_event(user.id, "subscription_configured", f"chat={chat_id}")
 
         context.user_data.pop("pending", None)
 
@@ -2225,9 +2786,9 @@ async def private_pending(update, context):
             )
             return
 
-        if uid in DEFAULT_ADMINS:
+        if uid == OWNER_ID or uid in DEFAULT_ADMINS:
             await message.reply_text(
-                "هذا المستخدم مشرف أساسي بالفعل."
+                "هذا المستخدم هو المالك أو مشرف أساسي بالفعل."
             )
             context.user_data.pop("pending", None)
             return
@@ -2237,6 +2798,7 @@ async def private_pending(update, context):
                 "INSERT OR IGNORE INTO bot_admins(user_id) VALUES(?)",
                 (uid,),
             )
+        audit_event(user.id, "bot_admin_added", str(uid))
 
         context.user_data.pop("pending", None)
 
@@ -2285,11 +2847,11 @@ async def status_command(update, context):
             cleaner_status(chat.id),
             parse_mode="HTML",
         )
-    else:
-        await message.reply_text(
-            stats_text(),
-            parse_mode="HTML",
-        )
+    elif chat and chat.type == ChatType.PRIVATE:
+        if not update.effective_user or not is_bot_admin(update.effective_user.id):
+            await message.reply_text("هذه الإحصائيات لمشرفي البوت المعتمدين فقط.")
+            return
+        await message.reply_text(stats_text(), parse_mode="HTML")
 
 
 async def enable_command(update, context):
@@ -2315,10 +2877,30 @@ async def disable_command(update, context):
         )
 
 
+async def post_init(application):
+    """Publish a compact Telegram command menu for the bot."""
+    commands = [
+        BotCommand("start", "فتح لوحة Cleaner"),
+        BotCommand("help", "دليل الاستخدام"),
+        BotCommand("status", "حالة البوت"),
+        BotCommand("ai", "المساعد الإداري الذكي"),
+        BotCommand("ai_stop", "إيقاف المساعد"),
+        BotCommand("ai_reset", "مسح سياق المساعد"),
+        BotCommand("health", "فحص سلامة النظام"),
+        BotCommand("audit", "سجل النشاط الإداري"),
+        BotCommand("backup", "نسخة احتياطية للمالك"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+    except TelegramError as exc:
+        log.warning("تعذر تحديث قائمة أوامر تيليجرام (%s)", type(exc).__name__)
+
+
 async def error_handler(update, context):
+    error = context.error
     log.error(
-        "خطأ أثناء معالجة تحديث",
-        exc_info=context.error,
+        "Update processing failed (%s). Check configuration and permissions.",
+        type(error).__name__ if error else "UnknownError",
     )
 
 
@@ -2333,8 +2915,18 @@ def main():
         )
 
     init_db()
+    try:
+        Path(DB_PATH).chmod(0o600)
+    except OSError:
+        pass
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(False)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clean", clean_command))
@@ -2345,9 +2937,27 @@ def main():
     app.add_handler(CommandHandler("reset_top", reset_top))
     app.add_handler(CommandHandler("admin_top", admin_top_command))
     app.add_handler(CommandHandler("reset_admin_top", reset_admin_top))
+    app.add_handler(CommandHandler("ai", ai_command))
+    app.add_handler(CommandHandler("ai_stop", ai_stop_command))
+    app.add_handler(CommandHandler("ai_reset", ai_reset_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("audit", audit_command))
+    app.add_handler(CommandHandler("backup", backup_command))
 
     app.add_handler(
         CallbackQueryHandler(panel_callback)
+    )
+
+    # رسائل المساعد الإداري في الخاص (للمشرفين المعتمدين فقط).
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & filters.TEXT
+            & ~filters.COMMAND,
+            ai_private_message,
+        ),
+        group=-1,
     )
 
     # إجابات لوحة التحكم في الخاص.
@@ -2389,11 +2999,17 @@ def main():
             expire_moderations, interval=15, first=5,
             name="expire_moderations",
         )
+        app.job_queue.run_repeating(
+            prune_tracking_job, interval=6 * 60 * 60, first=60,
+            name="prune_tracking_rows",
+        )
 
-    log.info("Cleaner started.")
+    log.info("Cleaner Pro started. Database: %s", Path(DB_PATH).name)
 
     app.run_polling(
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+        bootstrap_retries=5,
     )
 
 
